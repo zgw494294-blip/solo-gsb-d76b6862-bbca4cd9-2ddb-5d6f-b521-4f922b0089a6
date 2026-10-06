@@ -24,10 +24,20 @@
   pattern，此后按成功写入的连续样本值精确匹配，**允许重叠**（pattern 可以长于 `H` 和 `C`）。
   识别只保存流式自动机的标量状态，**不保存原始样本、不占用样本容量**；片段触发、片段删除、
   样本回收都不改变识别进度，命中记录在回收后依然保留。容量拒绝不推进匹配状态，重试成功只识别一次。
+- **命中留样（可选）**：已配置 pattern 且尚未写入样本的会话可经
+  `POST /sessions/{sid}/hit-fragments/enable` 启用一次（未配置 pattern、已有样本、重复启用、
+  模式长度超过 `C` 均返回 `409`，未知会话 `404`）。启用后**每次命中自动用现有片段编号生成
+  `completed` 片段**（`center`=命中末条序号、`before`=模式长度减 1、`after`=0，允许重叠，
+  不受手动触发 `before < H` 限制），**即使模式长于 `H` 也可查询原值**；流尾匹配 pattern
+  真前缀的最长后缀（**临时前缀**，即自动机标量状态对应的流尾区间）也须保留。
+  **历史、未删除片段与临时前缀按序号并集占用容量**；写入按本条匹配后的状态核算与回收，
+  超容返回 `409` 且**样本、样本与片段编号、匹配进度、命中记录与片段均不变**；
+  删除片段同样保护临时前缀；调参还须保证新 `C` 容得下完整模式及上述并集，否则 `409`
+  且不改变任何状态。未启用时原有行为完全不变。
 - **会话分叉**：`POST /sessions/{sid}/fork` 把当前采样会话复制为一条可独立续采的新会话。
   复制当时的 `H`、`C`、存活样本、全部未删除片段及其编号、下一样本与片段编号，以及模式配置、
-  自动机匹配进度、累计命中数和最近 100 次命中记录；**已回收样本不恢复，也不重放样本重新识别**
-  （直接复制自动机标量状态）。分叉在来源会话锁内取号并快照，等效于与来源已有操作串行执行的某个
+  自动机匹配进度、累计命中数、最近 100 次命中记录和命中留样启用状态（临时前缀随自动机状态
+  一并复制）；**已回收样本不恢复，也不重放样本重新识别**（直接复制自动机标量状态）。分叉在来源会话锁内取号并快照，等效于与来源已有操作串行执行的某个
   时刻，**不会混合两个时刻的状态**；来源本身保持不变。每次分叉都产生不同的、且与普通创建不冲突
   的新 `session_id`（共用同一个递增 ID 计数器），来源不存在返回 `404`，成功返回含新 `session_id`
   的**原会话查询结果**。分叉后两边的写入、触发、删除、参数调整和模式操作**互不影响**，各自继续
@@ -63,6 +73,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
 | PUT | `/sessions/{sid}/pattern` | 在首条样本写入前配置识别 pattern（1～32 个整数，仅一次） |
 | GET | `/sessions/{sid}/pattern/hits` | 查询累计命中数与最近 100 次命中的 `start_seq`/`end_seq` |
+| POST | `/sessions/{sid}/hit-fragments/enable` | 启用命中留样：每次模式命中自动生成 `completed` 留样片段（每会话一次） |
 | POST | `/sessions/{sid}/triggers` | 以当前末条为中心触发片段 |
 | GET | `/sessions/{sid}/fragments` | 列出所有未删除片段 |
 | GET | `/sessions/{sid}/fragments/{fid}` | 查询片段状态与样本内容 |
@@ -70,8 +81,10 @@ docker run --rm -p 8000:8000 sample-fragment-service
 
 错误码：`404` 会话/片段不存在；`409` 历史不足、容量不足、pattern 重复配置或已有样本后配置、
 查询未配置 pattern 的会话、调整参数与存活样本或片段冲突（新历史窗口含已回收样本、
-未删除片段总长或所需序号并集超过新 `C`）；`400` 触发参数违反 `before < H` 或
-`before+1+after ≤ C`；`422` 请求体不合法（含 pattern 长度非法、元素为布尔值或字符串，
+未删除片段总长或所需序号并集超过新 `C`）、命中留样启用条件不满足（未配置 pattern、已有样本、
+重复启用、模式长度超过 `C`）、启用命中留样后写入或调参超容（含新 `C` 容不下完整模式）；
+`400` 触发参数违反 `before < H` 或 `before+1+after ≤ C`；`422` 请求体不合法
+（含 pattern 长度非法、元素为布尔值或字符串，
 以及调整参数为布尔值/非整数或不满足 `1 ≤ H ≤ C ≤ 1000`）。
 
 ## 调用示例
@@ -401,6 +414,159 @@ curl -s http://localhost:8000/sessions/5
 分支 7 的待完成片段只等待分支 7 自己的后续样本，与分支 6 的 `seq=7` 无关；
 两支后续的容量拒绝、参数调整、模式配置等都各自按原规则独立校验。分叉不提供合并，
 服务仍为单进程内存态，重启后所有会话（含分支）都不保留。
+
+### 14. 启用命中留样（每会话一次）
+
+会话 8 以 `H=2, C=6` 创建，配置长度 5 的 pattern `[7,8,9,7,8]`（长于 `H`），然后启用命中留样：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 6}'
+# {"session_id":8,"history":2,"capacity":6}
+
+curl -s -X PUT http://localhost:8000/sessions/8/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [7, 8, 9, 7, 8]}'
+# {"pattern":[7,8,9,7,8]}
+
+curl -s -X POST http://localhost:8000/sessions/8/hit-fragments/enable
+# {"session_id":8,"hit_fragments_enabled":true,"pattern":[7,8,9,7,8]}
+```
+
+启用仅限**已配置 pattern 且尚未写入样本**的会话，每会话一次；其余不满足条件或
+模式长度超过 `C` 时返回 `409`，未知会话返回 `404`（拒绝均不改变任何状态）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/8/hit-fragments/enable
+# 409   —— 重复启用
+
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}' > /dev/null   # 会话 9
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/9/hit-fragments/enable
+# 409   —— 尚未配置 pattern
+
+curl -s -X PUT http://localhost:8000/sessions/9/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [1, 2, 3, 4]}' > /dev/null
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/9/hit-fragments/enable
+# 409   —— 模式长度 4 超过 C=3
+
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 5}' > /dev/null   # 会话 10
+curl -s -X PUT http://localhost:8000/sessions/10/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [1, 1]}' > /dev/null
+curl -s -X POST http://localhost:8000/sessions/10/samples \
+  -H 'Content-Type: application/json' -d '{"value": 1}' > /dev/null
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/10/hit-fragments/enable
+# 409   —— 已有样本写入
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/99/hit-fragments/enable
+# 404   —— 会话不存在
+```
+
+### 15. 长模式重叠命中自动留样
+
+会话 8 的 pattern 长度 5 > `H=2`。写入 `7 8 9 7 8` 后 `seq=5` 命中，自动用现有片段编号
+生成 `completed` 片段 1（`center=5`、`before=4`、`after=0`，即命中区间 `[1,5]`）：
+
+```bash
+for v in 7 8 9 7 8; do
+  curl -s -X POST http://localhost:8000/sessions/8/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}"; echo
+done
+# {"seq":1,"value":7}
+# {"seq":2,"value":8}
+# {"seq":3,"value":9}
+# {"seq":4,"value":7}
+# {"seq":5,"value":8}   —— 命中 (1,5)，片段 1 自动完成
+
+curl -s http://localhost:8000/sessions/8/fragments
+# [{"fragment_id":1,"center":5,"before":4,"after":0,"start":1,"end":5,"status":"completed"}]
+```
+
+命中片段引用的样本不受历史窗口回收影响，**模式长于 `H` 也可查询原值**：
+
+```bash
+curl -s http://localhost:8000/sessions/8/fragments/1
+# {"fragment_id":1,"center":5,"before":4,"after":0,"start":1,"end":5,"status":"completed",
+#  "samples":[{"seq":1,"value":7},{"seq":2,"value":8},{"seq":3,"value":9},
+#             {"seq":4,"value":7},{"seq":5,"value":8}]}
+```
+
+再写入 `9`（`seq=6`）。此时历史窗口 `{5,6}`、片段 1 `{1..5}` 与临时前缀 `{4,5,6}`
+（流尾 `7,8,9` 恰为 pattern 前 3 项）的并集 `{1..6}` 恰好占满 `C=6`：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/8/samples \
+  -H 'Content-Type: application/json' -d '{"value": 9}'
+# {"seq":6,"value":9}
+
+curl -s http://localhost:8000/sessions/8
+# {"session_id":8,"history":2,"capacity":6,"next_seq":7,"used":6,
+#  "stored_seqs":[1,2,3,4,5,6],"fragments":[1]}
+```
+
+### 16. 命中留样的容量拒绝、回滚与重试
+
+继续写 `7`：本条匹配后临时前缀将扩为 `{4..7}`，并集 `{1..7}` 共 7 个序号超出 `C=6`，
+返回 `409`——**样本、样本与片段编号、匹配进度、命中记录与片段均不变**（序号未消耗）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/8/samples \
+  -H 'Content-Type: application/json' -d '{"value": 7}'
+# 409
+
+curl -s http://localhost:8000/sessions/8
+# {"session_id":8,...,"next_seq":7,"used":6,"stored_seqs":[1,2,3,4,5,6],"fragments":[1]}
+
+curl -s http://localhost:8000/sessions/8/pattern/hits
+# {"pattern":[7,8,9,7,8],"hit_count":1,"recent_hits":[{"start_seq":1,"end_seq":5}]}
+```
+
+删除片段 1 释放容量。**删除同样保护临时前缀**：序号 `4,5,6` 是流尾匹配 pattern 真前缀的
+最长后缀，不随片段删除被回收。随后用相同值重试——被拒绝的写入从未进入自动机，重试只识别一次：
+
+```bash
+curl -s -X DELETE http://localhost:8000/sessions/8/fragments/1 -o /dev/null -w '%{http_code}\n'
+# 204
+
+curl -s http://localhost:8000/sessions/8
+# {"session_id":8,...,"next_seq":7,"used":3,"stored_seqs":[4,5,6],"fragments":[]}
+
+curl -s -X POST http://localhost:8000/sessions/8/samples \
+  -H 'Content-Type: application/json' -d '{"value": 7}'
+# {"seq":7,"value":7}
+
+curl -s -X POST http://localhost:8000/sessions/8/samples \
+  -H 'Content-Type: application/json' -d '{"value": 8}'
+# {"seq":8,"value":8}   —— 与首次命中重叠的 (4,8) 再次命中，自动生成片段 2
+```
+
+第二次命中 `(4,8)` 与第一次 `(1,5)` **重叠**，片段 2 与手动触发共用同一片段编号计数器，
+`before=4` 不受手动触发 `before < H` 限制：
+
+```bash
+curl -s http://localhost:8000/sessions/8/pattern/hits
+# {"pattern":[7,8,9,7,8],"hit_count":2,
+#  "recent_hits":[{"start_seq":1,"end_seq":5},{"start_seq":4,"end_seq":8}]}
+
+curl -s http://localhost:8000/sessions/8/fragments/2
+# {"fragment_id":2,"center":8,"before":4,"after":0,"start":4,"end":8,"status":"completed",
+#  "samples":[{"seq":4,"value":7},{"seq":5,"value":8},{"seq":6,"value":9},
+#             {"seq":7,"value":7},{"seq":8,"value":8}]}
+```
+
+启用命中留样后，调参还须保证新 `C` 容得下完整模式及历史、未删除片段与临时前缀的并集，
+否则 `409` 且不改变任何状态；分叉会复制启用状态与临时前缀，分支续采的命中继续自动留样，
+各支独立：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://localhost:8000/sessions/8/limits \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 4}'
+# 409   —— 新 C 容不下长度 5 的完整模式
+
+curl -s -X POST http://localhost:8000/sessions/8/fork
+# {"session_id":11,"history":2,"capacity":6,"next_seq":9,"used":5,
+#  "stored_seqs":[4,5,6,7,8],"fragments":[2]}
+```
 
 ## 本地开发（可选）
 
