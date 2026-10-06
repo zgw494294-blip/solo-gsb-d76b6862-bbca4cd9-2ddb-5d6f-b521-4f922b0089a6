@@ -11,9 +11,21 @@ pattern，此后每条成功写入的样本经流式 KMP 自动机精确匹配�
 自动机只保存标量状态，不保存原始样本、不占用样本容量，故样本回收与
 片段增删均不影响识别进度；命中记录在样本回收后仍然保留。
 
+可选的命中留样：已配置 pattern 且尚未写入样本的会话可启用一次
+（POST /sessions/{sid}/pattern/snapshot；模式长度超过 C 时拒绝）。
+启用后每次命中自动用现有片段编号生成一个 completed 片段
+（center=命中末条、before=模式长度-1、after=0，允许重叠，不受手动触发
+before<H 的限制），即使模式长于 H 也能查询命中原值；流尾匹配 pattern
+真前缀的最长后缀（临时前缀）同样受保护不被回收。历史、未删除片段与
+临时前缀按序号并集占用容量；写入按本条匹配后的状态核算并回收，超容
+则 409 且样本、样本与片段编号、匹配进度、命中记录和片段均不变。
+删除片段仍保护临时前缀；调参须保证新 C 容得下完整模式及上述并集，
+否则 409 且不变。未启用时行为与原来完全一致。
+
 会话可在任意时刻分叉为一条独立续采的新会话：复制当时的 H、C、存活样本、
 全部未删除片段及其编号、下一样本与片段编号，以及模式配置、自动机进度、
-累计命中与最近 100 次命中记录。分叉只复制存活状态：已回收样本不恢复，
+累计命中与最近 100 次命中记录、命中留样的启用状态（临时前缀随存活样本
+与自动机标量状态一并复制）。分叉只复制存活状态：已回收样本不恢复，
 也不重放样本重新识别（直接复制自动机标量状态）。分叉在来源会话锁内完成
 取号与快照，等效于与来源已有操作串行执行的某个时刻；来源保持不变，
 两支此后的写入、触发、删除、调参与模式操作互不影响。不提供合并与落盘。
@@ -95,8 +107,9 @@ class ConfigurePatternRequest(BaseModel):
 class PatternMatcher:
     """只保存标量状态的流式 KMP：逐样本喂入，不保存原始样本。
 
-    state 为当前匹配到的 pattern 前缀长度；feed 在恰好完整匹配时返回
-    True，否则返回 False。失败回退允许重叠命中。pattern 可以长于 H 和 C：
+    state 为当前匹配到的 pattern 前缀长度，即流尾与 pattern 真前缀匹配的
+    最长后缀的长度；feed 在恰好完整匹配时返回 True，否则返回 False。
+    失败回退允许重叠命中。pattern 可以长于 H 和 C：
     进度只依赖自动机状态，与样本是否被回收无关。
     """
 
@@ -116,7 +129,8 @@ class PatternMatcher:
         self.failure = failure
         self.state = 0
 
-    def feed(self, value: int) -> bool:
+    def peek(self, value: int) -> tuple[int, bool]:
+        """预演喂入一个样本：返回 (新状态, 是否恰好完整命中)，不修改 state。"""
         m = len(self.pattern)
         k = self.state
         while k > 0 and value != self.pattern[k]:
@@ -124,10 +138,12 @@ class PatternMatcher:
         if value == self.pattern[k]:
             k += 1
         if k == m:
-            self.state = self.failure[k - 1]  # 回退以支持重叠命中
-            return True
-        self.state = k
-        return False
+            return self.failure[k - 1], True  # 回退以支持重叠命中
+        return k, False
+
+    def feed(self, value: int) -> bool:
+        self.state, hit = self.peek(value)
+        return hit
 
 
 # ---------------- 会话状态 ----------------
@@ -169,18 +185,29 @@ class Session:
         self.pattern: list[int] | None = None
         self.matcher: PatternMatcher | None = None
         self.pattern_configured = False
+        # 命中留样：仅已配置 pattern 且尚未写入样本时可启用一次
+        self.snapshot_enabled = False
         self.hit_count = 0
         self.recent_hits: deque[dict] = deque(maxlen=100)  # 最近 100 次命中
         self.lock = asyncio.Lock()
 
     # ---- 容量核算 ----
 
-    def needed_seqs(self, upto: int, history: int | None = None) -> set[int]:
-        """假设已写入 upto 条时，历史窗口与所有未删除片段共同需要的序号集合。
+    def needed_seqs(
+        self,
+        upto: int,
+        history: int | None = None,
+        extra_fragment: tuple[int, int] | None = None,
+        tail: int | None = None,
+    ) -> set[int]:
+        """假设已写入 upto 条时，历史窗口、未删除片段与临时前缀共同需要的序号集合。
 
         history 缺省为当前 H；显式传入时按该长度核算（用于调整参数的预检）。
         同序号只计一次（集合语义）；片段只统计已写入的部分，
         未写入的后续样本在将来写入时再参与核算。
+        启用命中留样后，流尾匹配 pattern 真前缀的最长后缀（临时前缀）也须保留，
+        其长度即自动机当前状态；tail 显式传入时按该状态核算（用于写入预演）。
+        extra_fragment 把本条命中即将生成的片段 [start, end] 一并计入（写入预演）。
         """
         h = self.history if history is None else history
         lo = max(1, upto - h + 1)
@@ -189,10 +216,19 @@ class Session:
             hi = min(frag.end, upto)
             if frag.start <= hi:
                 needed.update(range(frag.start, hi + 1))
+        if extra_fragment is not None:
+            start, end = extra_fragment
+            hi = min(end, upto)
+            if start <= hi:
+                needed.update(range(start, hi + 1))
+        if self.snapshot_enabled and self.matcher is not None:
+            state = self.matcher.state if tail is None else tail
+            if state > 0:
+                needed.update(range(upto - state + 1, upto + 1))
         return needed
 
     def reclaim(self) -> None:
-        """回收历史窗口与所有未删除片段都不再需要的样本。"""
+        """回收历史窗口、未删除片段与临时前缀都不再需要的样本。"""
         live = self.needed_seqs(self.next_seq - 1)
         for seq in list(self.samples):
             if seq not in live:
@@ -215,6 +251,13 @@ class Session:
         # 未删除片段的总长不能超过新容量
         if any(f.before + 1 + f.after > capacity for f in self.fragments.values()):
             raise _conflict("存在总长超过新容量的未删除片段，无法调整")
+        # 启用命中留样后，新容量必须容得下完整模式（命中片段长度即模式长度）
+        if (
+            self.snapshot_enabled
+            and self.pattern is not None
+            and len(self.pattern) > capacity
+        ):
+            raise _conflict("新容量容不下完整模式，无法调整")
         # 新历史窗口与片段已写入部分的序号并集不能超过新容量
         if len(self.needed_seqs(upto, history)) > capacity:
             raise _conflict("新历史与未删除片段所需序号的并集超过新容量，无法调整")
@@ -234,24 +277,66 @@ class Session:
         self.matcher = PatternMatcher(self.pattern)
         self.pattern_configured = True
 
-    def observe(self, seq: int, value: int) -> None:
-        """样本成功提交后喂入自动机；命中则追加记录（与写样本同一串行临界区）。"""
-        if self.matcher is not None and self.matcher.feed(value):
-            assert self.pattern is not None
-            m = len(self.pattern)
-            self.hit_count += 1
-            self.recent_hits.append({"start_seq": seq - m + 1, "end_seq": seq})
+    # ---- 命中留样 ----
+
+    def enable_snapshot(self) -> None:
+        """启用命中自动留样；仅限已配置 pattern 且尚未写入样本的会话，每会话一次。
+
+        模式长度超过容量 C 时拒绝（命中片段长度即模式长度，必须容得下）。
+        任一条件不满足抛 409 且不改变任何状态。
+        """
+        if not self.pattern_configured:
+            raise _conflict("该会话尚未配置 pattern，无法启用命中留样")
+        if self.next_seq > 1:
+            raise _conflict("首条样本已写入，命中留样仅能在尚未写入样本时启用")
+        if self.snapshot_enabled:
+            raise _conflict("命中留样已启用，每会话仅可启用一次")
+        assert self.pattern is not None
+        if len(self.pattern) > self.capacity:
+            raise _conflict("模式长度超过样本容量 C，无法启用命中留样")
+        self.snapshot_enabled = True
+
+    def _record_hit(self, seq: int) -> None:
+        """追加一次命中记录（与写样本同一串行临界区）。"""
+        assert self.pattern is not None
+        m = len(self.pattern)
+        self.hit_count += 1
+        self.recent_hits.append({"start_seq": seq - m + 1, "end_seq": seq})
+
+    def _snapshot_fragment(self, end_seq: int) -> None:
+        """命中后自动生成完整片段：center=命中末条、before=模式长度-1、after=0。
+
+        与手动触发共用同一片段编号空间；允许重叠，且不受手动触发
+        before<H 的限制；end=center，创建即 completed。
+        """
+        assert self.pattern is not None
+        frag = Fragment(self.next_fragment_id, end_seq, len(self.pattern) - 1, 0)
+        self.fragments[frag.fragment_id] = frag
+        self.next_fragment_id += 1
 
     # ---- 操作 ----
 
     def write(self, value: int) -> int:
         """写入一条样本；容量不足时抛 409，不消耗序号、不改变历史或片段。
 
-        容量拒绝时不推进匹配状态、不产生命中记录；只有成功提交才喂入自动机，
-        因此同一值被拒绝后重试成功只会被识别一次。
+        容量按本条样本匹配后的状态核算：先预演自动机（不修改状态），启用
+        留样时把匹配后的临时前缀与命中即将生成的片段一并计入并集；超容则
+        拒绝，样本、样本与片段编号、匹配进度、命中记录和片段均不变。
+        只有成功提交才推进自动机，因此同一值被拒绝后重试成功只会被识别一次。
         """
         n = self.next_seq
-        needed = self.needed_seqs(n)
+        hit = False
+        new_state = None
+        extra = None
+        tail = None
+        if self.matcher is not None:
+            new_state, hit = self.matcher.peek(value)
+            if self.snapshot_enabled:
+                tail = new_state
+                if hit:
+                    assert self.pattern is not None
+                    extra = (n - len(self.pattern) + 1, n)
+        needed = self.needed_seqs(n, extra_fragment=extra, tail=tail)
         if len(needed) > self.capacity:
             raise _conflict("容量不足：新样本无处容纳，序号未消耗，状态未改变")
         # 不变式：needed ⊆ 现有 samples ∪ {n}，故此处不会 KeyError
@@ -259,7 +344,12 @@ class Session:
         kept[n] = value
         self.samples = kept
         self.next_seq = n + 1
-        self.observe(n, value)
+        if self.matcher is not None:
+            self.matcher.state = new_state
+            if hit:
+                self._record_hit(n)
+                if self.snapshot_enabled:
+                    self._snapshot_fragment(n)
         return n
 
     def trigger(self, before: int, after: int) -> Fragment:
@@ -291,7 +381,8 @@ class Session:
         """以当前快照派生出一条独立续采的新会话。
 
         复制 H、C、存活样本、全部未删除片段及其编号、下一样本与片段编号，
-        以及模式配置、自动机标量进度、累计命中与最近 100 次命中记录。
+        以及模式配置、自动机标量进度、累计命中与最近 100 次命中记录、
+        命中留样的启用状态（临时前缀随存活样本与自动机状态一并复制）。
         只复制存活状态：已回收样本不恢复，也不重放样本重新识别——自动机的
         state/failure 与 hit_count、recent_hits 原样拷贝，两支后续识别各自独立。
         调用方保证在来源锁内取号并调用本方法，故快照对应与来源操作串行的
@@ -306,6 +397,7 @@ class Session:
         }
         child.next_fragment_id = self.next_fragment_id
         child.pattern_configured = self.pattern_configured
+        child.snapshot_enabled = self.snapshot_enabled
         if self.pattern is not None:
             child.pattern = list(self.pattern)
             child.matcher = PatternMatcher(child.pattern)
@@ -433,6 +525,23 @@ async def configure_pattern(session_id: int, req: ConfigurePatternRequest) -> di
     async with sess.lock:
         sess.configure_pattern(req.pattern)
         return {"pattern": sess.pattern}
+
+
+@app.post("/sessions/{session_id}/pattern/snapshot", status_code=201)
+async def enable_pattern_snapshot(session_id: int) -> dict:
+    """启用命中自动留样：此后每次模式命中自动生成一个 completed 片段。
+
+    仅限已配置 pattern 且尚未写入样本的会话，每会话一次；模式长度超过
+    容量 C 时拒绝。会话不存在返回 404，其余条件不满足返回 409 且状态不变。
+    """
+    sess = _get_session(session_id)
+    async with sess.lock:
+        sess.enable_snapshot()
+        return {
+            "session_id": sess.session_id,
+            "pattern": sess.pattern,
+            "snapshot_enabled": sess.snapshot_enabled,
+        }
 
 
 @app.get("/sessions/{session_id}/pattern/hits")

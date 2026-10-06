@@ -24,9 +24,19 @@
   pattern，此后按成功写入的连续样本值精确匹配，**允许重叠**（pattern 可以长于 `H` 和 `C`）。
   识别只保存流式自动机的标量状态，**不保存原始样本、不占用样本容量**；片段触发、片段删除、
   样本回收都不改变识别进度，命中记录在回收后依然保留。容量拒绝不推进匹配状态，重试成功只识别一次。
+- **命中自动留样（可选）**：已配置 pattern 且**尚未写入样本**的会话可启用一次
+  （`POST /sessions/{sid}/pattern/snapshot`；模式长度超过 `C` 时返回 `409`）。
+  启用后每次命中自动用现有片段编号生成一个 `completed` 片段（`center`=命中末条、
+  `before`=模式长度-1、`after`=0，**允许重叠**，不受手动触发 `before < H` 的限制），
+  **即使模式长于 `H` 也能查询命中原值**；流尾匹配 pattern 真前缀的最长后缀（临时前缀）
+  同样受保护不被回收。历史、未删除片段与临时前缀按序号并集占用容量；写入按本条匹配后的
+  状态核算并回收，超容返回 `409` 且**样本、样本与片段编号、匹配进度、命中记录和片段均不变**。
+  删除片段仍保护临时前缀；调整参数须保证新 `C` 容得下完整模式及上述并集，否则 `409` 且不变。
+  未启用时行为与原来完全一致。
 - **会话分叉**：`POST /sessions/{sid}/fork` 把当前采样会话复制为一条可独立续采的新会话。
   复制当时的 `H`、`C`、存活样本、全部未删除片段及其编号、下一样本与片段编号，以及模式配置、
-  自动机匹配进度、累计命中数和最近 100 次命中记录；**已回收样本不恢复，也不重放样本重新识别**
+  自动机匹配进度、累计命中数和最近 100 次命中记录、命中留样的启用状态（临时前缀随存活样本
+  与自动机状态一并复制）；**已回收样本不恢复，也不重放样本重新识别**
   （直接复制自动机标量状态）。分叉在来源会话锁内取号并快照，等效于与来源已有操作串行执行的某个
   时刻，**不会混合两个时刻的状态**；来源本身保持不变。每次分叉都产生不同的、且与普通创建不冲突
   的新 `session_id`（共用同一个递增 ID 计数器），来源不存在返回 `404`，成功返回含新 `session_id`
@@ -62,6 +72,7 @@ docker run --rm -p 8000:8000 sample-fragment-service
 | PUT | `/sessions/{sid}/limits` | 不停采样地调整 `history`(H) 与 `capacity`(C)，返回会话状态 |
 | POST | `/sessions/{sid}/samples` | 写入一条整数样本 |
 | PUT | `/sessions/{sid}/pattern` | 在首条样本写入前配置识别 pattern（1～32 个整数，仅一次） |
+| POST | `/sessions/{sid}/pattern/snapshot` | 启用命中自动留样（须已配置 pattern 且尚未写入样本，每会话一次） |
 | GET | `/sessions/{sid}/pattern/hits` | 查询累计命中数与最近 100 次命中的 `start_seq`/`end_seq` |
 | POST | `/sessions/{sid}/triggers` | 以当前末条为中心触发片段 |
 | GET | `/sessions/{sid}/fragments` | 列出所有未删除片段 |
@@ -70,8 +81,10 @@ docker run --rm -p 8000:8000 sample-fragment-service
 
 错误码：`404` 会话/片段不存在；`409` 历史不足、容量不足、pattern 重复配置或已有样本后配置、
 查询未配置 pattern 的会话、调整参数与存活样本或片段冲突（新历史窗口含已回收样本、
-未删除片段总长或所需序号并集超过新 `C`）；`400` 触发参数违反 `before < H` 或
-`before+1+after ≤ C`；`422` 请求体不合法（含 pattern 长度非法、元素为布尔值或字符串，
+未删除片段总长或所需序号并集超过新 `C`、启用留样后新 `C` 容不下完整模式）、
+启用命中留样条件不满足（未配置 pattern、已有样本写入、重复启用、模式长度超过 `C`）；
+`400` 触发参数违反 `before < H` 或 `before+1+after ≤ C`；`422` 请求体不合法
+（含 pattern 长度非法、元素为布尔值或字符串，
 以及调整参数为布尔值/非整数或不满足 `1 ≤ H ≤ C ≤ 1000`）。
 
 ## 调用示例
@@ -401,6 +414,166 @@ curl -s http://localhost:8000/sessions/5
 分支 7 的待完成片段只等待分支 7 自己的后续样本，与分支 6 的 `seq=7` 无关；
 两支后续的容量拒绝、参数调整、模式配置等都各自按原规则独立校验。分叉不提供合并，
 服务仍为单进程内存态，重启后所有会话（含分支）都不保留。
+
+### 14. 命中自动留样：长模式重叠命中、拒绝与重试
+
+会话 8 以 `H=2, C=6` 创建，配置长度 4 的 pattern `[1,2,3,1]`（**长于 H=2**），
+然后启用命中自动留样（每会话仅一次，须已配置 pattern 且尚未写入样本）：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 6}'
+# {"session_id":8,"history":2,"capacity":6}
+
+curl -s -X PUT http://localhost:8000/sessions/8/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [1, 2, 3, 1]}'
+# {"pattern":[1,2,3,1]}
+
+curl -s -X POST http://localhost:8000/sessions/8/pattern/snapshot
+# {"session_id":8,"pattern":[1,2,3,1],"snapshot_enabled":true}
+```
+
+**临时前缀保护**：写入 `1,2,3` 后自动机状态为 3，流尾的最长真前缀匹配 `[1,2,3]`
+占 3 条，超出 `H=2` 的历史窗口——序号 1 本应按历史窗口回收，但作为临时前缀被保留：
+
+```bash
+for v in 1 2 3; do
+  curl -s -X POST http://localhost:8000/sessions/8/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+
+curl -s http://localhost:8000/sessions/8
+# {"session_id":8,"history":2,"capacity":6,"next_seq":4,"used":3,"stored_seqs":[1,2,3],"fragments":[]}
+```
+
+**长模式命中自动成片**：再写入 `1` 命中 `[1,2,3,1]`，自动用现有片段编号生成
+`completed` 片段（`center=4`、`before=3`、`after=0`，`before` 不受手动触发
+`before < H` 的限制），模式长于 `H` 也能查询命中原值：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/8/samples \
+  -H 'Content-Type: application/json' -d '{"value": 1}'
+# {"seq":4,"value":1}
+
+curl -s http://localhost:8000/sessions/8/fragments/1
+# {"fragment_id":1,"center":4,"before":3,"after":0,"start":1,"end":4,"status":"completed",
+#  "samples":[{"seq":1,"value":1},{"seq":2,"value":2},{"seq":3,"value":3},{"seq":4,"value":1}]}
+```
+
+**超容拒绝，状态不变**：继续写入 `2,3` 后，历史、片段 1 与临时前缀的并集已占满
+`C=6`；再写 `1` 本可重叠命中 `[3..6]+1`，但命中片段 `[4,7]` 会使并集达到 7 条，
+写入按本条匹配后的状态核算，超容返回 `409`——序号未消耗、匹配进度与命中记录不变：
+
+```bash
+for v in 2 3; do
+  curl -s -X POST http://localhost:8000/sessions/8/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/8/samples \
+  -H 'Content-Type: application/json' -d '{"value": 1}'
+# 409   —— 并集 {1..7} 超出 C=6，next_seq 仍为 7，自动机状态与命中记录均未推进
+
+curl -s http://localhost:8000/sessions/8/pattern/hits
+# {"pattern":[1,2,3,1],"hit_count":1,"recent_hits":[{"start_seq":1,"end_seq":4}]}
+```
+
+**删除仍保护临时前缀**：删除片段 1 后回收，历史窗口为 `{5,6}`，但临时前缀
+`{4,5,6}`（自动机状态 3）仍受保护，序号 4 不被回收：
+
+```bash
+curl -s -X DELETE http://localhost:8000/sessions/8/fragments/1 -o /dev/null -w '%{http_code}\n'
+# 204
+
+curl -s http://localhost:8000/sessions/8
+# {"session_id":8,"history":2,"capacity":6,"next_seq":7,"used":3,"stored_seqs":[4,5,6],"fragments":[]}
+```
+
+**重试成功，重叠命中只记一次**：用相同的值重试，命中 `[4,7]` 并生成片段 2，
+与片段 1 的命中 `(1,4)` 在序号 4 处重叠；被拒绝的那次写入不会补算：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/8/samples \
+  -H 'Content-Type: application/json' -d '{"value": 1}'
+# {"seq":7,"value":1}
+
+curl -s http://localhost:8000/sessions/8/pattern/hits
+# {"pattern":[1,2,3,1],"hit_count":2,
+#  "recent_hits":[{"start_seq":1,"end_seq":4},{"start_seq":4,"end_seq":7}]}
+
+curl -s http://localhost:8000/sessions/8/fragments/2
+# {"fragment_id":2,"center":7,"before":3,"after":0,"start":4,"end":7,"status":"completed",
+#  "samples":[{"seq":4,"value":1},{"seq":5,"value":2},{"seq":6,"value":3},{"seq":7,"value":1}]}
+```
+
+**调参约束**：启用留样后新 `C` 必须容得下完整模式（长度 4），`C=3` 返回 `409`
+且状态不变；`C=4` 容得下模式与当前并集 `{4,5,6,7}`，调整成功：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT http://localhost:8000/sessions/8/limits \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}'
+# 409   —— 新容量容不下完整模式
+
+curl -s -X PUT http://localhost:8000/sessions/8/limits \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 4}'
+# {"session_id":8,"history":2,"capacity":4,"next_seq":8,"used":4,"stored_seqs":[4,5,6,7],"fragments":[2]}
+```
+
+**分叉复制启用状态与临时前缀**：分叉会话 8 得到会话 9，启用状态、自动机进度
+（状态 1，即流尾 `1`）一并复制。分支 9 删除片段 2 释放容量后续写 `2,3,1`，
+与复制来的流尾 `1` 拼成命中 `[7,10]`，自动生成片段 3；来源会话 8 不受影响：
+
+```bash
+curl -s -X POST http://localhost:8000/sessions/8/fork
+# {"session_id":9,"history":2,"capacity":4,"next_seq":8,"used":4,
+#  "stored_seqs":[4,5,6,7],"fragments":[2]}
+
+curl -s -X DELETE http://localhost:8000/sessions/9/fragments/2 -o /dev/null -w '%{http_code}\n'
+# 204
+
+for v in 2 3 1; do
+  curl -s -X POST http://localhost:8000/sessions/9/samples \
+    -H 'Content-Type: application/json' -d "{\"value\": $v}" > /dev/null
+done
+
+curl -s http://localhost:8000/sessions/9/fragments/3
+# {"fragment_id":3,"center":10,"before":3,"after":0,"start":7,"end":10,"status":"completed",
+#  "samples":[{"seq":7,"value":1},{"seq":8,"value":2},{"seq":9,"value":3},{"seq":10,"value":1}]}
+
+curl -s http://localhost:8000/sessions/8/pattern/hits
+# {"pattern":[1,2,3,1],"hit_count":2,
+#  "recent_hits":[{"start_seq":1,"end_seq":4},{"start_seq":4,"end_seq":7}]}   —— 来源不变
+```
+
+**启用条件**：未配置 pattern、已有样本写入、重复启用、模式长度超过 `C` 均返回
+`409`；未知会话返回 `404`：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/8/pattern/snapshot
+# 409   —— 重复启用
+
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 2, "capacity": 3}' > /dev/null   # 会话 10
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/10/pattern/snapshot
+# 409   —— 尚未配置 pattern
+
+curl -s -X PUT http://localhost:8000/sessions/10/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [9]}' > /dev/null
+curl -s -X POST http://localhost:8000/sessions/10/samples \
+  -H 'Content-Type: application/json' -d '{"value": 9}' > /dev/null
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/10/pattern/snapshot
+# 409   —— 已有样本写入
+
+curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' -d '{"history": 1, "capacity": 2}' > /dev/null   # 会话 11
+curl -s -X PUT http://localhost:8000/sessions/11/pattern \
+  -H 'Content-Type: application/json' -d '{"pattern": [1, 2, 3]}' > /dev/null
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/11/pattern/snapshot
+# 409   —— 模式长度 3 超过 C=2
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/sessions/99/pattern/snapshot
+# 404   —— 会话不存在
+```
 
 ## 本地开发（可选）
 
